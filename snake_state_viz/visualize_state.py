@@ -2,16 +2,22 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
 
+from builtin_interfaces.msg import Duration
 from std_msgs.msg import String, Header
 # from snakelib_control.pykdl_utils.kdl_kinematics import KDLKinematics
 from snakelib_control.pykdl_utils.kdl_parser import kdl_tree_from_urdf_model
 from snakelib_msgs.msg import HebiSensors
+from geometry_msgs.msg import Point
 
 from urdf_parser_py.urdf import Robot
 
 import PyKDL
 
+import numpy as np
+import pinocchio as pin
+
 from tf2_ros import TransformBroadcaster, TransformStamped
+from visualization_msgs.msg import Marker
 
 
 def frame_to_tf(frame:PyKDL.Frame, frame_id:str, header:Header) -> TransformStamped: 
@@ -43,7 +49,7 @@ def get_fk_all_frames(chain:PyKDL.Chain, joint_angles:list[float]) -> list[PyKDL
     Computes forward kinematics for every segment/frame in a PyKDL.Chain.
     
     :param chain: PyKDL.Chain object containing the kinematic segments.
-    :param joint_angles: PyKDL.JntArray containing positions for all movable joints.
+    :param joint_angles: list containing positions for all movable joints.
     :return: A list of PyKDL.Frame objects, one for each segment in the chain.
     """
     # Verify that the input joint array matches the chain's joint count
@@ -62,8 +68,6 @@ def get_fk_all_frames(chain:PyKDL.Chain, joint_angles:list[float]) -> list[PyKDL
     for i in range(num_segments):
         segment = chain.getSegment(i)
         joint = segment.getJoint()
-
-        print(joint.getName(), joint.getTypeName())
         
         # Determine joint displacement depending on whether it's movable or fixed
         if joint.getTypeName() == "Fixed":
@@ -89,9 +93,119 @@ def get_fk_all_frames(chain:PyKDL.Chain, joint_angles:list[float]) -> list[PyKDL
     
     return frames_list[1:]
 
+class RobotOrientationEKF:
+    def __init__(self, model, IMU_frame_name, dt=0.001):
+        """
+        An Extended Kalman Filter to estimate robot floating-base orientation 
+        using an IMU accelerometer and encoder joint angles (q).
+
+        State vector x = [q_base, omega_bias] (dim: 3 for orientation + 3 for bias = 6)
+        Note: For simplicity on SO(3), we track orientation error or use exponential coordinates.
+        Here we track roll/pitch/yaw error state or full orientation via rotation matrix/quaternion.
+        """
+        self.model = model
+        self.data = model.createData()
+        self.imu_frame_id = model.getFrameId(IMU_frame_name)
+        self.dt = dt
+
+        # Gravity vector in world frame
+        self.g_world = np.array([0, 0, -9.81])
+
+        # State initialization: R_base (Rotation matrix), bias (gyro/accel drift)
+        self.R_base = np.eye(3)
+        self.bias_omega = np.zeros(3)
+
+        # Covariance matrices
+        self.P = np.eye(6) * 0.01  # State covariance
+        self.Q = np.eye(6) * 0.001 # Process noise covariance
+        self.R = np.eye(3) * 0.1   # Measurement noise covariance (accelerometer)
+
+    def skew(self, v):
+        return np.array([[0, -v[2], v[1]],
+                         [v[2], 0, -v[0]],
+                         [-v[1], v[0], 0]])
+
+    def predict(self, omega_measured):
+        """
+        Predict step using gyroscope measurement (angular velocity).
+        """
+        # Unbiased angular velocity
+        omega = omega_measured - self.bias_omega
+
+        # Exponential map for rotation matrix update
+        theta = np.linalg.norm(omega) * self.dt
+        if theta > 1e-6:
+            axis = omega / np.linalg.norm(omega)
+            R_update = pin.exp3(axis * theta)
+        else:
+            R_update = np.eye(3)
+
+        self.R_base = self.R_base @ R_update
+
+        # Error state Jacobian (F matrix)
+        F = np.eye(6)
+        F[0:3, 3:6] = -self.R_base * self.dt
+
+        # Covariance prediction
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update(self, q_joints, acc_measured):
+        """
+        Update step using joint angles (q) and accelerometer measurement.
+        Assumes quasi-static assumption (acceleration is dominated by gravity).
+        """
+        # Update Pinocchio kinematics with current base estimation
+        # q_full consists of [base_pos(3), base_quat(4), joints(n)]
+        q_full = np.zeros(self.model.nq)
+        # Set base orientation in Pinocchio q
+        quat = pin.Quaternion(self.R_base)
+        q_full[3:7] = quat.coeffs()
+        q_full[7:] = q_joints
+
+        pin.forwardKinematics(self.model, self.data, q_full)
+        pin.updateFramePlacements(self.model, self.data)
+
+        # Get current IMU frame orientation relative to world
+        R_imu = self.data.oMf[self.imu_frame_id].rotation
+
+        # Expected gravity in the IMU frame
+        acc_predicted = R_imu.T @ (-self.g_world)
+
+        # Innovation/Measurement residual
+        y = acc_measured - acc_predicted
+
+        # Measurement Jacobian H
+        # H maps state errors to acceleration innovations
+        H = np.zeros((3, 6))
+        # Derivative of R_imu.T @ -g with respect to base rotation error
+        H[0:3, 0:3] = self.skew(acc_predicted)
+
+        # Kalman Gain
+        S = H @ self.P @ H.T + self.R
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        # State correction
+        dx = K @ y
+
+        # Apply orientation correction
+        self.R_base = self.R_base @ pin.exp3(dx[0:3])
+        self.bias_omega += dx[3:6]
+
+        # Covariance update
+        self.P = (np.eye(6) - K @ H) @ self.P
+
+        return self.R_base
+
+
 class MinimalPublisher(Node):
+    # For KDL
     _chain: PyKDL.Chain | None = None
     _joint_map: dict[int, str] = {}
+    _imu_offsets: dict[int, str] = {}
+    # For pinocchio
+    _joint_names: list[str] = []
+    _model: pin.Model | None = None
+    _data: pin.Data | None = None
 
     def __init__(self):
         super().__init__('minimal_publisher')
@@ -118,10 +232,30 @@ class MinimalPublisher(Node):
             
         )
 
-        # Initialize the transform broadcaster
-        self.tf_broadcaster = TransformBroadcaster(self)
+        self._marker_pub = self.create_publisher(
+            Marker,
+            "/accelerations",
+            100,
+        )
 
-    def hebi_cb(self, msg:HebiSensors):
+        self._marker_msg = Marker()
+        self._marker_msg.lifetime = Duration(sec=0, nanosec=500000000)
+        self._marker_msg.header.frame_id = 'head'
+        self._marker_msg.type = Marker.LINE_LIST
+        self._marker_msg.id = 0
+        self._marker_msg.action = Marker.ADD
+        self._marker_msg.color.r = 1.0
+        self._marker_msg.color.g = 0.0
+        self._marker_msg.color.b = 0.0
+        self._marker_msg.color.a = 0.1
+        self._marker_msg.scale.x = 0.01
+        self._marker_msg.scale.y = 0.01
+        self._marker_msg.scale.z = 0.01
+
+        # Initialize the transform broadcaster
+        self._tf_broadcaster = TransformBroadcaster(self)
+
+    def hebi_cb_kdl(self, msg:HebiSensors):
         if self._chain is None:
             return
         if not self._joint_map:
@@ -132,12 +266,126 @@ class MinimalPublisher(Node):
         header = msg.header
         header.frame_id = 'head_link'
 
+
+        self._marker_msg.header = header
+        self._marker_msg.points.clear()
+
         frames = get_fk_all_frames(self._chain, msg.position)
-        for name, frame in zip(msg.name, frames):
-            self.tf_broadcaster.sendTransform(frame_to_tf(frame, f'/test/{name}', header))
+        for i in range(len(msg.name)):
+            name = msg.name[i]
+            frame = frames[i]
+            self._tf_broadcaster.sendTransform(frame_to_tf(frame, f'/test/{name}', header))
+            base = frame * self._imu_offsets[name]
+            accel = base * PyKDL.Vector(
+                msg.lin_acc.x[i] * 0.02,
+                msg.lin_acc.y[i] * 0.02,
+                msg.lin_acc.z[i] * 0.02
+            )
+            pointA = Point(x=base.p.x(), y=base.p.y(), z=base.p.z())
+            pointB = Point(x=accel.x(), y=accel.y(), z=accel.z())
+            self._marker_msg.points.append(pointA)
+            self._marker_msg.points.append(pointB)
+
+        self._marker_pub.publish(self._marker_msg)
+
+    def get_vecs_in_head_frame(self, local_vecs):
+        # This only works after pin.forwardKinematics and pin.updateFramePlacements
+        head_vecs = []
+        for i, (acc, name) in enumerate(zip(local_vecs, self._joint_names)):
+            frame_id = self._model.getFrameId(f'{name}_imu')
+            R_imu = self._data.oMf[frame_id].rotation
+            head_vecs.append(R_imu @ acc)
+
+        return head_vecs
+
+    def get_gravity(self, lin_acc:np.array, outlier_deg:float=10):
+        # Accelerations should be provided in the head frame
+
+        # Reject lin_acc near zero
+        min_norm = 1e-3
+        norms =  np.linalg.norm(lin_acc, axis=1)
+        rejected = np.argwhere(norms <= min_norm).flatten().tolist()
+        accepted = np.argwhere(norms > min_norm).flatten().tolist()
+        U = np.array([lin_acc[i] for i in range(len(lin_acc)) if i in accepted])
+
+        # Robust central direction: component-wise median of the unit vectors,
+        # renormalized. Dominated by the agreeing majority, so outliers don't move it.
+        med = np.median(U, axis=0)
+        mn = np.linalg.norm(med)
+        if mn < 1e-9: # degenerate median -> fall back
+            med = U.mean(axis=0); mn = np.linalg.norm(med)
+            if mn < 1e-9:
+                return None, 0.0, [i for i in range(len(len(lin_acc)))]
+        med = med / mn
+
+        # Reject modules whose direction is > outlier_deg from the median.
+        cos_thr = np.cos(np.radians(outlier_deg))
+        keep = (U @ med) >= cos_thr
+        if int(keep.sum()) < 4: # too few survivors -> keep all
+            keep = np.ones(len(U), dtype=bool)
+        rejected += [accepted[j] for j in range(len(accepted)) if not keep[j]]
+
+        mean_vec = U[keep].mean(axis=0)
+        agreement = float(np.linalg.norm(mean_vec)) # over survivors
+        if agreement < 1e-6:
+            return None, 0.0, rejected
+
+        return mean_vec / agreement, agreement, rejected
+
+    def hebi_cb(self, msg:HebiSensors):
+        if self._model is None:
+            return
+        header = msg.header
+        header.frame_id = 'head_link'
+        self._marker_msg.header = header
+        self._marker_msg.points.clear()
+
+        pin.forwardKinematics(
+            self._model,
+            self._data,
+            np.array(msg.position, dtype=np.float64),
+            np.array(msg.velocity, dtype=np.float64),
+        )
+        pin.updateFramePlacements(self._model, self._data)
+
+        # Get linear accelerations
+        lin_acc = zip(msg.lin_acc.x, msg.lin_acc.y, msg.lin_acc.z)
+        lin_acc = self.get_vecs_in_head_frame(lin_acc)
+
+        # Get angular velocities
+        ang_vel = zip(msg.ang_vel.x, msg.ang_vel.y, msg.ang_vel.z)
+        ang_vel = self.get_vecs_in_head_frame(lin_acc)
+
+        # Get gravity direction
+        grav, _, _ = self.get_gravity(lin_acc)
+        print(grav)
+        self._marker_msg.points.append(Point(x=0.0,y=0.0,z=0.0))
+        self._marker_msg.points.append(Point(
+            x=float(grav[0]),
+            y=float(grav[1]),
+            z=float(grav[2])
+        ))
+        print(self._marker_msg)
+        self._marker_pub.publish(self._marker_msg)
 
     def robot_description_cb(self, msg:String):
+        self._model = pin.buildModelFromXML(msg.data)
+        # self._model = pin.buildModelFromXML(msg.data, pin.JointModelFreeFlyer())
+        self._data = self._model.createData()
+        self._joint_names = [
+            self._model.names[i] for i in range(1, self._model.njoints)
+            if "Revolute" in self._model.joints[i].shortname()
+        ]
+
+    def robot_description_cb_kdl(self, msg:String):
         urdf = Robot.from_xml_string(msg.data)
+        for joint in urdf.joints:
+            if '_link_to_imu' in joint.name:
+                module_name = joint.name.replace('_link_to_imu','')
+                self._imu_offsets[module_name] = PyKDL.Frame(
+                    PyKDL.Rotation.RPY(*joint.origin.rpy),
+                    PyKDL.Vector(*joint.origin.xyz)
+                )
         kdl_tree = kdl_tree_from_urdf_model(urdf)
         self._chain = kdl_tree.getChain('head_link', 'tail_link')
         
