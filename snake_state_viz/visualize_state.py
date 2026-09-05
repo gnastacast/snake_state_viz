@@ -288,7 +288,7 @@ class MinimalPublisher(Node):
 
         self._marker_pub.publish(self._marker_msg)
 
-    def get_vecs_in_head_frame(self, local_vecs):
+    def get_imu_vecs_in_head_frame(self, local_vecs):
         # This only works after pin.forwardKinematics and pin.updateFramePlacements
         head_vecs = []
         for i, (acc, name) in enumerate(zip(local_vecs, self._joint_names)):
@@ -339,33 +339,39 @@ class MinimalPublisher(Node):
         header.frame_id = 'head_link'
         self._marker_msg.header = header
         self._marker_msg.points.clear()
-
-        pin.forwardKinematics(
-            self._model,
-            self._data,
-            np.array(msg.position, dtype=np.float64),
-            np.array(msg.velocity, dtype=np.float64),
-        )
+        q = np.array(msg.position, dtype=np.float64)
+        v = np.array(msg.velocity, dtype=np.float64)
+        pin.forwardKinematics(self._model, self._data, q, v)
         pin.updateFramePlacements(self._model, self._data)
 
         # Get linear accelerations
         lin_acc = zip(msg.lin_acc.x, msg.lin_acc.y, msg.lin_acc.z)
-        lin_acc = self.get_vecs_in_head_frame(lin_acc)
+        lin_acc = self.get_imu_vecs_in_head_frame(lin_acc)
 
         # Get angular velocities
         ang_vel = zip(msg.ang_vel.x, msg.ang_vel.y, msg.ang_vel.z)
-        ang_vel = self.get_vecs_in_head_frame(lin_acc)
+        ang_vel = self.get_imu_vecs_in_head_frame(lin_acc)
+
+        # Predict angular velocities from kinematics
+        local_ang_vel = []
+        for name in self._joint_names:
+            spatial_vel = pin.getFrameVelocity(
+                self._model,
+                self._data,
+                self._model.getFrameId(f'{name}_imu'),
+                pin.ReferenceFrame.LOCAL
+            )
+            local_ang_vel.append(spatial_vel.angular)
 
         # Get gravity direction
         grav, _, _ = self.get_gravity(lin_acc)
-        print(grav)
+
         self._marker_msg.points.append(Point(x=0.0,y=0.0,z=0.0))
         self._marker_msg.points.append(Point(
             x=float(grav[0]),
             y=float(grav[1]),
             z=float(grav[2])
         ))
-        print(self._marker_msg)
         self._marker_pub.publish(self._marker_msg)
 
     def robot_description_cb(self, msg:String):
