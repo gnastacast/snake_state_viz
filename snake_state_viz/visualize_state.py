@@ -10,6 +10,7 @@ from snakelib_msgs.msg import HebiSensors
 from geometry_msgs.msg import Point
 
 from urdf_parser_py.urdf import Robot
+from collections.abc import Iterable
 
 import PyKDL
 
@@ -117,8 +118,7 @@ def get_fk_all_frames(chain:PyKDL.Chain, joint_angles:list[float]) -> list[PyKDL
 
 def mean_of_rotations(rotations, max_iters=10, tol=1e-6):
     """
-    Computes the geometric mean of a list of pinocchio.SE3 matrices
-    (or flat SO(3) rotations via an isolated free-flyer model joint type).
+    Computes the geometric mean of a list of 3x3 rotation matrices
     """
     # Start with the first rotation as our initial guess
     mean_R = rotations[0]
@@ -395,6 +395,99 @@ class MinimalPublisher(Node):
 
         return mean_vec / agreement, agreement, rejected
 
+    def get_yaw_offset(self, orientation:pin.SE3, desired_x):
+        # Given an orientation and a desired heading along X, rotate along
+        # Z axis to match heading.
+        # TODO: this should be a single rotation not a whole matrix
+        z_ax = orientation[:,2]
+        z_ax = z_ax / np.linalg.norm(z_ax)
+        # Compute the perpendicular component
+        y_ax = np.cross(desired_x, z_ax)
+        y_ax = y_ax / np.linalg.norm(y_ax)
+        x_ax = np.cross(z_ax, y_ax)
+        x_ax = x_ax / np.linalg.norm(x_ax)
+        if np.dot(desired_x, x_ax) < 0:
+            x_ax = -x_ax
+        new_O = np.vstack([x_ax, y_ax, z_ax]).T
+        if np.linalg.det(new_O) < 0:
+            y_ax = -y_ax
+        new_O = np.vstack([x_ax, y_ax, z_ax]).T
+        retval = (new_O.T @ orientation).T
+        retval = retval / (np.abs(np.linalg.det(retval)) ** (1 /  retval.shape[0]))
+        return retval
+
+    def draw_frames(self, positions: Iterable[float], orientations:Iterable[pin.SE3]):
+        xs = [o[:,0] * 0.1 for o in orientations[0:]]
+        ys = [o[:,1] * 0.1 for o in orientations[0:]]
+        zs = [o[:,2] * 0.1 for o in orientations[0:]]
+
+        for i, (x, p) in enumerate(zip(xs, positions)):
+            self._marker_msg.points.append(Point(x=p[0],y=p[1],z=p[2]))
+            self._marker_msg.points.append(Point(
+                x=float(x[0] + p[0]),
+                y=float(x[1] + p[1]),
+                z=float(x[2] + p[2])
+            ))
+            self._marker_msg.colors.append(ColorRGBA(r=1.0, a=1.0, g=(i % 2 / 4) ))# / len(xs) / 2)))
+            self._marker_msg.colors.append(ColorRGBA(r=1.0, a=1.0, g=(i % 2 / 4) ))# / len(xs) / 2)))
+        for i, (y, p) in enumerate(zip(ys, positions)):
+            self._marker_msg.points.append(Point(x=p[0],y=p[1],z=p[2]))
+            self._marker_msg.points.append(Point(
+                x=float(y[0] + p[0]),
+                y=float(y[1] + p[1]),
+                z=float(y[2] + p[2])
+            ))
+            self._marker_msg.colors.append(ColorRGBA(g=1.0, a=1.0, b=(i % 2 / 4) ))# / len(xs) / 2)))
+            self._marker_msg.colors.append(ColorRGBA(g=1.0, a=1.0, b=(i % 2 / 4) ))# / len(xs) / 2)))
+        for i, (z, p) in enumerate(zip(zs, positions)):
+            self._marker_msg.points.append(Point(x=p[0],y=p[1],z=p[2]))
+            self._marker_msg.points.append(Point(
+                x=float(z[0] + p[0]),
+                y=float(z[1] + p[1]),
+                z=float(z[2] + p[2])
+            ))
+            self._marker_msg.colors.append(ColorRGBA(b=1.0, a=1.0, r=(i % 2 / 4) ))# / len(xs) / 2)))
+            self._marker_msg.colors.append(ColorRGBA(b=1.0, a=1.0, r=(i % 2 / 4) ))# / len(xs) / 2)))
+        self._marker_pub.publish(self._marker_msg)
+
+
+    def get_orientation(self, orientations:Iterable[pin.SE3], draw_debug=True):
+        # 1) Transforms each orientation into the head frame
+        # 2) Updates self._yaw_offsets.
+        # 3) Returns a global orientation
+
+        if self._yaw_offsets is None:
+            self._yaw_offsets = [None] * len(orientations)
+
+        new_orientations = []
+
+        for i, (mat, name) in enumerate(zip(orientations, self._joint_names)):
+            frame_id = self._model.getFrameId(f'{name}_link')
+            R = self._data.oMf[frame_id].rotation
+            mat = self._imu_offsets[i].rotation.T @ mat
+            # TODO: Figure out why this is needed
+            mat = mat @ pin.rpy.rpyToMatrix(0, np.pi/2, 0)
+            mat = pin.rpy.rpyToMatrix(np.pi/2, 0, np.pi) @ mat
+            mat = R  @ self._imu_offsets[i].rotation.T @ mat
+            # Initialize yaw offsets to point to global x
+            if self._yaw_offsets[i] is None:
+                self._yaw_offsets[i] = self.get_yaw_offset(mat, [1,0,0])
+
+            new_orientations.append(mat @ self._yaw_offsets[i])
+
+        # TODO: assess why this is failing
+        # dets = np.linalg.det(orientations)
+        # assert np.allclose(dets, 1), dets[np.bitwise_not(np.isclose(dets, 1))]
+
+        mean = mean_of_rotations(new_orientations)
+
+        # TODO: see whether updating yaw is worth it. For some reason it drifts more.
+
+        if draw_debug:
+            pos =  [self._data.oMf[self._model.getFrameId(f'{name}_link')].translation for name in self._joint_names]
+            self.draw_frames(pos, new_orientations)
+
+        return mean
 
 
     def hebi_cb(self, msg:HebiSensors):
@@ -419,78 +512,13 @@ class MinimalPublisher(Node):
             msg.orientation.z,
         )
         orientations = [pin.Quaternion(*o).toRotationMatrix() for o in orientations]
-        # orientations = self.imu_to_head_frame(orientations)
-        # orientations = [b.rotation.T @ a for a, b in zip(orientations, self._imu_offsets)]
-        # orientations = [pin.rpy.rpyToMatrix(np.pi/2, 0, np.pi) @ o for o in orientations]
-        if self._yaw_offsets is None:
-            self._yaw_offsets = [None] * len(orientations)
+        world_orientation = self.get_orientation(orientations)
+        world_pos = pin.centerOfMass(self._model, self._data)
 
-        for i, (mat, name) in enumerate(zip(orientations, self._joint_names)):
-            frame_id = self._model.getFrameId(f'{name}_link')
-            R = self._data.oMf[frame_id].rotation
-            orientations[i] = self._imu_offsets[i].rotation.T @ orientations[i] @ pin.rpy.rpyToMatrix(0, np.pi/2, 0)
-            orientations[i] = pin.rpy.rpyToMatrix(np.pi/2, 0, np.pi) @ orientations[i]
-            orientations[i] = R  @ self._imu_offsets[i].rotation.T @ orientations[i]
-
-            if self._yaw_offsets[i] is None:
-                x_R = [1, 0, 0]
-                # x_R = R[:, 0].flatten()
-                z_O = orientations[i][:,2]
-                # Compute the perpendicular component
-                y_O = np.cross(x_R, z_O)
-                y_O = y_O / np.linalg.norm(y_O)
-                x_O = np.cross(z_O, y_O)
-                x_O = x_O / np.linalg.norm(x_O)
-                if np.dot(x_R, x_O) < 0:
-                    x_O = -x_O
-                new_O = np.vstack([x_O, y_O, z_O]).T
-                if np.linalg.det(new_O) < 0:
-                    y_O = -y_O
-                new_O = np.vstack([x_O, y_O, z_O]).T
-                self._yaw_offsets[i] = (new_O.T @ orientations[i]).T
-
-            orientations[i] = orientations[i] @ self._yaw_offsets[i]
-
-        assert np.allclose([np.linalg.det(o) for o in orientations], 1)
-
-        world = pin.SE3(mean_of_rotations(orientations).T, np.array([0,0,0], np.float64))
+        world = pin.SE3(world_orientation, world_pos).inverse()
         header_world = deepcopy(header)
         header_world.frame_id = 'world'
         self._tf_broadcaster.sendTransform(pin_to_tf(world, '/head_link', header_world))
-
-        xs = [o[:,0] * 0.1 for o in orientations[0:]]
-        ys = [o[:,1] * 0.1 for o in orientations[0:]]
-        zs = [o[:,2] * 0.1 for o in orientations[0:]]
-
-        pos =  [self._data.oMf[self._model.getFrameId(f'{name}_link')].translation for name in self._joint_names]
-        for i, (x, p) in enumerate(zip(xs, pos)):
-            self._marker_msg.points.append(Point(x=p[0],y=p[1],z=p[2]))
-            self._marker_msg.points.append(Point(
-                x=float(x[0] + p[0]),
-                y=float(x[1] + p[1]),
-                z=float(x[2] + p[2])
-            ))
-            self._marker_msg.colors.append(ColorRGBA(r=1.0, a=1.0, g=(i % 2 / 4) ))# / len(xs) / 2)))
-            self._marker_msg.colors.append(ColorRGBA(r=1.0, a=1.0, g=(i % 2 / 4) ))# / len(xs) / 2)))
-        for i, (y, p) in enumerate(zip(ys, pos)):
-            self._marker_msg.points.append(Point(x=p[0],y=p[1],z=p[2]))
-            self._marker_msg.points.append(Point(
-                x=float(y[0] + p[0]),
-                y=float(y[1] + p[1]),
-                z=float(y[2] + p[2])
-            ))
-            self._marker_msg.colors.append(ColorRGBA(g=1.0, a=1.0, b=(i % 2 / 4) ))# / len(xs) / 2)))
-            self._marker_msg.colors.append(ColorRGBA(g=1.0, a=1.0, b=(i % 2 / 4) ))# / len(xs) / 2)))
-        for i, (z, p) in enumerate(zip(zs, pos)):
-            self._marker_msg.points.append(Point(x=p[0],y=p[1],z=p[2]))
-            self._marker_msg.points.append(Point(
-                x=float(z[0] + p[0]),
-                y=float(z[1] + p[1]),
-                z=float(z[2] + p[2])
-            ))
-            self._marker_msg.colors.append(ColorRGBA(b=1.0, a=1.0, r=(i % 2 / 4) ))# / len(xs) / 2)))
-            self._marker_msg.colors.append(ColorRGBA(b=1.0, a=1.0, r=(i % 2 / 4) ))# / len(xs) / 2)))
-        self._marker_pub.publish(self._marker_msg)
 
     def hebi_cb_(self, msg:HebiSensors):
         if self._model is None:
