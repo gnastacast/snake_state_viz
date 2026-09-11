@@ -464,11 +464,10 @@ class MinimalPublisher(Node):
         for i, (mat, name) in enumerate(zip(orientations, self._joint_names)):
             frame_id = self._model.getFrameId(f'{name}_link')
             R = self._data.oMf[frame_id].rotation
-            mat = self._imu_offsets[i].rotation.T @ mat
-            # TODO: Figure out why this is needed
+            # TODO: Figure out why this is needed and isn't self._imu_offsets
             mat = mat @ pin.rpy.rpyToMatrix(0, np.pi/2, 0)
             mat = pin.rpy.rpyToMatrix(np.pi/2, 0, np.pi) @ mat
-            mat = R  @ self._imu_offsets[i].rotation.T @ mat
+            mat = R  @ mat
             # Initialize yaw offsets to point to global x
             if self._yaw_offsets[i] is None:
                 self._yaw_offsets[i] = self.get_yaw_offset(mat, [1,0,0])
