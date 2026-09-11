@@ -416,10 +416,10 @@ class MinimalPublisher(Node):
         retval = retval / (np.abs(np.linalg.det(retval)) ** (1 /  retval.shape[0]))
         return retval
 
-    def draw_frames(self, positions: Iterable[float], orientations:Iterable[pin.SE3]):
-        xs = [o[:,0] * 0.1 for o in orientations[0:]]
-        ys = [o[:,1] * 0.1 for o in orientations[0:]]
-        zs = [o[:,2] * 0.1 for o in orientations[0:]]
+    def draw_frames(self, positions: Iterable[float], orientations:Iterable[pin.SE3], scale=0.1):
+        xs = [o[:,0] * scale for o in orientations[0:]]
+        ys = [o[:,1] * scale for o in orientations[0:]]
+        zs = [o[:,2] * scale for o in orientations[0:]]
 
         for i, (x, p) in enumerate(zip(xs, positions)):
             self._marker_msg.points.append(Point(x=p[0],y=p[1],z=p[2]))
