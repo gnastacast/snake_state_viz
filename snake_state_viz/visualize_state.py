@@ -474,9 +474,10 @@ class MinimalPublisher(Node):
 
             new_orientations.append(mat @ self._yaw_offsets[i])
 
-        # TODO: assess why this is failing
-        # dets = np.linalg.det(orientations)
-        # assert np.allclose(dets, 1), dets[np.bitwise_not(np.isclose(dets, 1))]
+        # Check for valid matrices
+        dets = np.linalg.det(orientations)
+        mask = np.bitwise_not(np.isclose(dets, 1))
+        assert not np.any(mask), zip(self._joint_names[mask], dets[mask])
 
         mean = mean_of_rotations(new_orientations)
 
